@@ -2,5 +2,5 @@
   <Configurations>
     <Platform Name="x64" />
   </Configurations>
-  <Project Path="adcr2025_visWeather.vcxproj" />
+  <Project Path="adcr2025_visWeather.vcxproj" Id="d0e79d28-9ec1-4b3e-9dd0-58fc59a04e1d" />
 </Solution>

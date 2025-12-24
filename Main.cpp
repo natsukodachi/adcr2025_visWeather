@@ -3,18 +3,16 @@
 
 using namespace netCDF;
 
-constexpr double g = 9.80665; // m/s^2（重力加速度。ジオポテンシャル→高度換算に使用）
-
-// ERA5 の Z500（500hPa ジオポテンシャル高度）を格納する構造体
+// ERA5 の PMSL（海面更正気圧）を格納する構造体
 struct weatherData
 {
-	Grid<double> z;      // 高度 [m]
-	Array<double> lats;  // 緯度配列 [度]
-	Array<double> lons;  // 経度配列 [度]
+	Grid<double> pmsl;  // 海面更正気圧 [hPa]
+	Array<double> lats; // 緯度配列 [度]
+	Array<double> lons; // 経度配列 [度]
 };
 
-// NetCDF から Z500 データを読み込む
-void LoadZ500(weatherData& field, const FilePath& ncPath)
+// NetCDF から PMSL データを読み込む
+void LoadPMSL(weatherData& field, const FilePath& ncPath)
 {
 	// NetCDF ファイルを読み込みモードで開く
 	NcFile nc(Unicode::Narrow(ncPath), NcFile::read);
@@ -22,17 +20,18 @@ void LoadZ500(weatherData& field, const FilePath& ncPath)
 	// 変数ハンドルを取得
 	NcVar latVar = nc.getVar("latitude");
 	NcVar lonVar = nc.getVar("longitude");
-	NcVar zVar = nc.getVar("z");
+	NcVar mslVar = nc.getVar("msl"); // ERA5 の海面更正気圧（単位: Pa）
 
 	// 必須変数が存在するかチェック
-	if (latVar.isNull() || lonVar.isNull() || zVar.isNull())
+	if (latVar.isNull() || lonVar.isNull() || mslVar.isNull())
 	{
-		throw Error{ U"latitude / longitude / z が見つかりません" };
+		throw Error{ U"latitude / longitude / msl が見つかりません" };
 	}
 
 	// 次元サイズ取得（緯度・経度）
 	const size_t nLat = latVar.getDim(0).getSize();
 	const size_t nLon = lonVar.getDim(0).getSize();
+
 
 	// 緯度・経度配列を読み込み
 	field.lats.resize(nLat);
@@ -40,42 +39,42 @@ void LoadZ500(weatherData& field, const FilePath& ncPath)
 	latVar.getVar(field.lats.data());
 	lonVar.getVar(field.lons.data());
 
-	// z の読み込み範囲指定
-	Array<size_t> start = { 0, 0, 0, 0 };
-	Array<size_t> count = { 1, 1, nLat, nLon };
+	// msl の読み込み範囲指定（time/level/lat/lon の順を想定）
+	Array<size_t> start = { 0, 0, 0 };
+	Array<size_t> count = { 1, nLat, nLon };
 
-	// バッファに読み込み
+	// バッファに読み込み（単位: Pa）
 	Array<float> buf(nLat * nLon);
-	zVar.getVar(start, count, buf.data());
+	mslVar.getVar(start, count, buf.data());
 
-	// Grid は z[y][x] なので width=nLon, height=nLat に整形
-	field.z.resize(nLon, nLat); // width=nLon, height=nLat（Grid は z[y][x]）
+	// Grid は pmsl[y][x] なので width=nLon, height=nLat に整形
+	field.pmsl.resize(nLon, nLat); // width=nLon, height=nLat（Grid は pmsl[y][x]）
 
-	// ジオポテンシャル→高度（m）へ換算して格納
+	// Pa → hPa に換算して格納
 	for (size_t j = 0; j < nLat; ++j)
 	{
 		for (size_t i = 0; i < nLon; ++i)
 		{
-			const double geopotential = buf[j * nLon + i];
-			field.z[j][i] = geopotential / g;
+			const double pa = buf[j * nLon + i];
+			field.pmsl[j][i] = pa * 0.01; // 1 hPa = 100 Pa
 		}
 	}
 }
 
-// カラーマップ画像を作成
-Image CreateColormapImage(const Grid<double>& z, double vmin, double vmax, ColormapType cmapType)
+// カラーマップ画像を作成（pmsl 用）
+Image CreateColormapImage(const Grid<double>& data, double vmin, double vmax, ColormapType cmapType)
 {
 	// 値の範囲を 0.0-1.0 に正規化
 	const double invRange = 1.0 / (vmax - vmin);
-	const int32 w = static_cast<int32>(z.width());
-	const int32 h = static_cast<int32>(z.height());
+	const int32 w = static_cast<int32>(data.width());
+	const int32 h = static_cast<int32>(data.height());
 
 	Image img(w, h);
 	for (int32 y = 0; y < h; ++y)
 	{
 		for (int32 x = 0; x < w; ++x)
 		{
-			double t = (z[y][x] - vmin) * invRange;
+			double t = (data[y][x] - vmin) * invRange;
 			t = Clamp(t, 0.0, 1.0);
 			img[y][x] = Colormap01F(t, cmapType);
 		}
@@ -110,6 +109,32 @@ static GeoBounds GetBounds(const weatherData& field)
 		bounds.latMax = Max(bounds.latMax, lat);
 	}
 	return bounds;
+}
+
+// Grid の最小値・最大値を取得（min は 100 以上の値のみを対象）
+std::pair<double, double> GetMinMax(const Grid<double>& data) {
+	double mn = std::numeric_limits<double>::infinity();
+	double mx = -std::numeric_limits<double>::infinity();
+	bool hasMin = false; // 100 以上の有効値が見つかったか
+	const int32 w = static_cast<int32>(data.width());
+	const int32 h = static_cast<int32>(data.height());
+	for (int32 y = 0; y < h; ++y) {
+		for (int32 x = 0; x < w; ++x) {
+			const double v = data[y][x];
+			// 最小値は 100 以上の値のみを考慮
+			if (v >= 100.0) {
+				if (!hasMin || v < mn) mn = v;
+				hasMin = true;
+			}
+			// 最大値は従来通り全値を対象
+			if (v > mx) mx = v;
+		}
+	}
+	// 100 以上が見つからなかった場合のフォールバック
+	if (!hasMin) {
+		mn = 100.0;
+	}
+	return { mn, mx };
 }
 
 // 海岸線
@@ -179,21 +204,24 @@ private:
 void Main()
 {
 	// ウィンドウ初期化
-	Window::Resize(1280, 720);
+	Window::Resize(600, 600);
 	Scene::SetBackground(ColorF{ 0.2, 0.3, 0.4 });
 
 	// NetCDF 入力ファイル（例）
-	const String ncPath = U"era5_z500_20250905_12_100E_170E_20N_60N.nc";
+	const String ncPath = U"pmsl.nc";
 	weatherData field;
-	LoadZ500(field, ncPath); // データ読み込み
+	LoadPMSL(field, ncPath); // PMSL を読み込み
 
-	const int32 w = static_cast<int32>(field.z.width());
-	const int32 h = static_cast<int32>(field.z.height());
+	const int32 w = static_cast<int32>(field.pmsl.width());
+	const int32 h = static_cast<int32>(field.pmsl.height());
 
-	// カラーマップ用の表示範囲（vmin/vmax は例示値）
-	const double vmin = 5479.0;
-	const double vmax = 5943.0;
-	Texture cmapTex{ CreateColormapImage(field.z, vmin, vmax, ColormapType::Viridis) };
+	const auto [pmin, pmax] = GetMinMax(field.pmsl);
+	Print << U"pmsl min:" << pmin << U" pmsl max:" << pmax;
+
+	// カラーマップ用の表示範囲をデータの最小値・最大値に合わせる（単位: hPa）
+	const double vmin = pmin;
+	const double vmax = pmax;
+	Texture cmapTex{ CreateColormapImage(field.pmsl, vmin, vmax, ColormapType::Turbo) };
 
 	// 経度・緯度の範囲取得
 	const auto bounds = GetBounds(field);
