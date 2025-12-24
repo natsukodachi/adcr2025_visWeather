@@ -413,4 +413,5 @@ gmon.out
 #**/App/example
 #**/App/engine
 #**/App/dll
-#**/App/*.nc
+**/App/*.nc
+
